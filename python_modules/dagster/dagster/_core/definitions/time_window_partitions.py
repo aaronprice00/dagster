@@ -360,7 +360,7 @@ class TimeWindowPartitionsDefinition(PartitionsDefinition, IHaveNew):
             )
 
         if exclusions:
-            check.list_param(
+            check.set_param(
                 exclusions,
                 "exclusions",
                 of_type=(str, datetime),
