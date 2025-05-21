@@ -10,6 +10,7 @@ import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import datetime
 from enum import Enum
 from typing import Any, Final, NamedTuple, Optional, Union, cast
 
@@ -815,7 +816,7 @@ class TimeWindowPartitionsSnap(PartitionsSnap):
     end: Optional[float] = None
     cron_schedule: Optional[str] = None
     # exclusions
-    exclusions: Optional[set[str]] = None
+    exclusions: Optional[set[Union[str, datetime]]] = None
     # superseded by cron_schedule, but kept around for backcompat
     schedule_type: Optional[ScheduleType] = None
     # superseded by cron_schedule, but kept around for backcompat

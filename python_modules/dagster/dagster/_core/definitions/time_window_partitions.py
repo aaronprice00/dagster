@@ -289,8 +289,10 @@ class TimeWindowPartitionsDefinition(PartitionsDefinition, IHaveNew):
             passed. If end_offset is 0 (the default), the last partition ends before the current
             time. If end_offset is 1, the second-to-last partition ends before the current time,
             and so on.
-        exclusions (Optional[Set[str]]): Specifies a set of partition keys to be excluded from the
-            partition set.
+        exclusions (Optional[Set[Union[str, datetime]]]): Specifies a set of cron strings or
+            datetime objects that should be excluded from the partition set. Every tick of the
+            cron schedule that matches an excluded datetime or matches the tick of an excluded
+            cron string will be excluded from the partition set.
     """
 
     start_ts: TimestampWithTimezone
@@ -299,7 +301,7 @@ class TimeWindowPartitionsDefinition(PartitionsDefinition, IHaveNew):
     fmt: PublicAttr[str]
     end_offset: PublicAttr[int]
     cron_schedule: PublicAttr[str]
-    exclusions: PublicAttr[Optional[set[str]]]
+    exclusions: PublicAttr[Optional[set[Union[str, datetime]]]]
 
     def __new__(
         cls,
@@ -313,7 +315,7 @@ class TimeWindowPartitionsDefinition(PartitionsDefinition, IHaveNew):
         hour_offset: Optional[int] = None,
         day_offset: Optional[int] = None,
         cron_schedule: Optional[str] = None,
-        exclusions: Optional[set[str]] = None,
+        exclusions: Optional[set[Union[str, datetime]]] = None,
     ):
         check.opt_str_param(timezone, "timezone")
         timezone = timezone or "UTC"
@@ -356,6 +358,25 @@ class TimeWindowPartitionsDefinition(PartitionsDefinition, IHaveNew):
                 f"Found invalid cron schedule '{cron_schedule}' for a"
                 " TimeWindowPartitionsDefinition."
             )
+
+        if exclusions:
+            check.list_param(
+                exclusions,
+                "exclusions",
+                of_type=(str, datetime),
+            )
+            cron_exclusions = [cs for cs in exclusions if isinstance(cs, str)]
+            invalid_exclusions = [cs for cs in cron_exclusions if not is_valid_cron_schedule(cs)]
+            if invalid_exclusions:
+                if len(invalid_exclusions) == 1:
+                    invalid_exclusion_str = f"'{invalid_exclusions[0]}'"
+                else:
+                    invalid_exclusion_str = "'" + "', '".join(invalid_exclusions) + "'"
+                raise DagsterInvalidDefinitionError(
+                    f"Found invalid cron schedule(s) {invalid_exclusion_str} in the exclusions"
+                    " argument for a TimeWindowPartitionsDefinition. Expected a set of valid cron"
+                    " strings and datetime objects."
+                )
 
         return super().__new__(
             cls,
@@ -560,11 +581,12 @@ class TimeWindowPartitionsDefinition(PartitionsDefinition, IHaveNew):
                     if len(offset_time_windows) >= self.end_offset - offset_partitions_count:
                         break
 
-                    partition_key = dst_safe_strftime(
-                        time_window.start, self.timezone, self.fmt, self.cron_schedule
-                    )
-                    if not self.is_partition_excluded(partition_key):
-                        offset_time_windows.append(partition_key)
+                    if not self.is_window_start_excluded(time_window.start):
+                        offset_time_windows.append(
+                            dst_safe_strftime(
+                                time_window.start, self.timezone, self.fmt, self.cron_schedule
+                            )
+                        )
 
             partition_keys = list(reversed(offset_time_windows))[:limit]
             offset_partitions_count += len(partition_keys)
@@ -1081,18 +1103,15 @@ class TimeWindowPartitionsDefinition(PartitionsDefinition, IHaveNew):
             cron_string=self.cron_schedule,
             execution_timezone=self.timezone,
         )
-        prev_time = next(iterator)
-        while prev_time.timestamp() < start_timestamp:
-            prev_time = next(iterator)
+        curr_time = next(iterator)
+        while curr_time.timestamp() < start_timestamp:
+            curr_time = next(iterator)
 
         while True:
             next_time = next(iterator)
-            candidate_partition_key = dst_safe_strftime(
-                prev_time, self.timezone, self.fmt, self.cron_schedule
-            )
-            if not self.is_partition_excluded(candidate_partition_key):
-                yield TimeWindow(prev_time, next_time)
-            prev_time = next_time
+            if not self.is_window_start_excluded(curr_time):
+                yield TimeWindow(curr_time, next_time)
+            curr_time = next_time
 
     def _reverse_iterate_time_windows(self, end_timestamp: float) -> Iterable[TimeWindow]:
         """Returns an infinite generator of time windows that end before the given end time."""
@@ -1102,18 +1121,15 @@ class TimeWindowPartitionsDefinition(PartitionsDefinition, IHaveNew):
             execution_timezone=self.timezone,
         )
 
-        prev_time = next(iterator)
-        while prev_time.timestamp() > end_timestamp:
-            prev_time = next(iterator)
+        curr_time = next(iterator)
+        while curr_time.timestamp() > end_timestamp:
+            curr_time = next(iterator)
 
         while True:
-            next_time = next(iterator)
-            candidate_partition_key = dst_safe_strftime(
-                next_time, self.timezone, self.fmt, self.cron_schedule
-            )
-            if not self.is_partition_excluded(candidate_partition_key):
-                yield TimeWindow(next_time, prev_time)
-            prev_time = next_time
+            prev_time = next(iterator)
+            if not self.is_window_start_excluded(prev_time):
+                yield TimeWindow(prev_time, curr_time)
+            curr_time = prev_time
 
     def get_partition_key_for_timestamp(self, timestamp: float, end_closed: bool = False) -> str:
         """Args:
@@ -1126,30 +1142,44 @@ class TimeWindowPartitionsDefinition(PartitionsDefinition, IHaveNew):
             prev_dt = next(rev_iter)
             if end_closed and prev_dt.timestamp() == timestamp:
                 continue
+
+            if self.is_window_start_excluded(prev_dt):
+                continue
+
             prev_partition_key = dst_safe_strftime(
                 prev_dt, self.timezone, self.fmt, self.cron_schedule
             )
-            if self.is_partition_excluded(prev_partition_key):
-                prev_partition_key = None
 
         iterator = cron_string_iterator(timestamp, self.cron_schedule, self.timezone)
         next_partition_key = None
         next_dt = None
         while next_partition_key is None:
             next_dt = next(iterator)
+            if self.is_window_start_excluded(next_dt):
+                continue
             next_partition_key = dst_safe_strftime(
                 next_dt, self.timezone, self.fmt, self.cron_schedule
             )
-            if self.is_partition_excluded(next_partition_key):
-                next_partition_key = None
 
         if end_closed or (next_dt and next_dt.timestamp() > timestamp):
             return prev_partition_key
         else:
             return next_partition_key
 
-    def is_partition_excluded(self, partition_key):
-        return self.exclusions and partition_key in self.exclusions
+    def is_window_start_excluded(self, dt: datetime):
+        if not self.exclusions:
+            return False
+
+        if dt in self.exclusions:
+            return True
+
+        excluded_cron_strings = [
+            cron_string for cron_string in self.exclusions if isinstance(cron_string, str)
+        ]
+        for cron_string in excluded_cron_strings:
+            if dt == next(cron_string_iterator(dt.timestamp(), cron_string, self.timezone)):
+                return True
+        return False
 
     def less_than(self, partition_key1: str, partition_key2: str) -> bool:
         """Returns true if the partition_key1 is earlier than partition_key2."""
@@ -1190,14 +1220,14 @@ class TimeWindowPartitionsDefinition(PartitionsDefinition, IHaveNew):
         dynamic_partitions_store: Optional[DynamicPartitionsStore] = None,
     ) -> bool:
         """Returns a boolean representing if the given partition key is valid."""
-        if self.is_partition_excluded(partition_key):
-            return False
-
         try:
             partition_start_time = self.start_time_for_partition_key(partition_key)
             partition_start_timestamp = partition_start_time.timestamp()
         except ValueError:
             # unparseable partition key
+            return False
+
+        if self.is_window_start_excluded(partition_start_time):
             return False
 
         first_partition_window = self.get_first_partition_window(current_time=current_time)
@@ -1239,11 +1269,11 @@ class TimeWindowPartitionsDefinition(PartitionsDefinition, IHaveNew):
 
     @property
     def is_basic_daily(self) -> bool:
-        return is_basic_daily(self.cron_schedule)
+        return not self.exclusions and is_basic_daily(self.cron_schedule)
 
     @property
     def is_basic_hourly(self) -> bool:
-        return is_basic_hourly(self.cron_schedule)
+        return not self.exclusions and is_basic_hourly(self.cron_schedule)
 
 
 class DailyPartitionsDefinition(TimeWindowPartitionsDefinition):
@@ -1270,8 +1300,10 @@ class DailyPartitionsDefinition(TimeWindowPartitionsDefinition):
             passed. If end_offset is 0 (the default), the last partition ends before the current
             time. If end_offset is 1, the second-to-last partition ends before the current time,
             and so on.
-        exclusions (Optional[Set[str]]): Specifies a set of partition keys to be excluded from the
-            partition set.
+        exclusions (Optional[Set[Union[str, datetime]]]): Specifies a set of cron strings or
+            datetime objects that should be excluded from the partition set. Every tick of the
+            cron schedule that matches an excluded datetime or matches the tick of an excluded
+            cron string will be excluded from the partition set.
 
     .. code-block:: python
 
@@ -1297,7 +1329,7 @@ class DailyPartitionsDefinition(TimeWindowPartitionsDefinition):
         timezone: Optional[str] = None,
         fmt: Optional[str] = None,
         end_offset: int = 0,
-        exclusions: Optional[set[str]] = None,
+        exclusions: Optional[set[Union[str, datetime]]] = None,
         **kwargs,
     ):
         _fmt = fmt or DEFAULT_DATE_FORMAT
@@ -1358,7 +1390,7 @@ def daily_partitioned_config(
     fmt: Optional[str] = None,
     end_offset: int = 0,
     tags_for_partition_fn: Optional[Callable[[datetime, datetime], Mapping[str, str]]] = None,
-    exclusions: Optional[set[str]] = None,
+    exclusions: Optional[set[Union[str, datetime]]] = None,
 ) -> Callable[
     [Callable[[datetime, datetime], Mapping[str, Any]]],
     PartitionedConfig[DailyPartitionsDefinition],
@@ -1393,8 +1425,10 @@ def daily_partitioned_config(
         tags_for_partition_fn (Optional[Callable[[str], Mapping[str, str]]]): A function that
             accepts a partition time window and returns a dictionary of tags to attach to runs for
             that partition.
-        exclusions (Optional[Set[str]]): Specifies a set of partition keys to be excluded from the
-            partition set.
+        exclusions (Optional[Set[Union[str, datetime]]]): Specifies a set of cron strings or
+            datetime objects that should be excluded from the partition set. Every tick of the
+            cron schedule that matches an excluded datetime or matches the tick of an excluded
+            cron string will be excluded from the partition set.
 
     .. code-block:: python
 
@@ -1459,8 +1493,10 @@ class HourlyPartitionsDefinition(TimeWindowPartitionsDefinition):
             passed. If end_offset is 0 (the default), the last partition ends before the current
             time. If end_offset is 1, the second-to-last partition ends before the current time,
             and so on.
-        exclusions (Optional[Set[str]]): Specifies a set of partition keys to be excluded from the
-            partition set.
+        exclusions (Optional[Set[Union[str, datetime]]]): Specifies a set of cron strings or
+            datetime objects that should be excluded from the partition set. Every tick of the
+            cron schedule that matches an excluded datetime or matches the tick of an excluded
+            cron string will be excluded from the partition set.
 
     .. code-block:: python
 
@@ -1485,7 +1521,7 @@ class HourlyPartitionsDefinition(TimeWindowPartitionsDefinition):
         timezone: Optional[str] = None,
         fmt: Optional[str] = None,
         end_offset: int = 0,
-        exclusions: Optional[set[str]] = None,
+        exclusions: Optional[set[Union[str, datetime]]] = None,
         **kwargs,
     ):
         _fmt = fmt or DEFAULT_HOURLY_FORMAT_WITHOUT_TIMEZONE
@@ -1517,7 +1553,7 @@ def hourly_partitioned_config(
     fmt: Optional[str] = None,
     end_offset: int = 0,
     tags_for_partition_fn: Optional[Callable[[datetime, datetime], Mapping[str, str]]] = None,
-    exclusions: Optional[set[str]] = None,
+    exclusions: Optional[set[Union[str, datetime]]] = None,
 ) -> Callable[
     [Callable[[datetime, datetime], Mapping[str, Any]]],
     PartitionedConfig[HourlyPartitionsDefinition],
@@ -1551,8 +1587,10 @@ def hourly_partitioned_config(
         tags_for_partition_fn (Optional[Callable[[str], Mapping[str, str]]]): A function that
             accepts a partition time window and returns a dictionary of tags to attach to runs for
             that partition.
-        exclusions (Optional[Set[str]]): Specifies a set of partition keys to be excluded from the
-            partition set.
+        exclusions (Optional[Set[Union[str, datetime]]]): Specifies a set of cron strings or
+            datetime objects that should be excluded from the partition set. Every tick of the
+            cron schedule that matches an excluded datetime or matches the tick of an excluded
+            cron string will be excluded from the partition set.
 
     .. code-block:: python
 
@@ -1615,8 +1653,10 @@ class MonthlyPartitionsDefinition(TimeWindowPartitionsDefinition):
             passed. If end_offset is 0 (the default), the last partition ends before the current
             time. If end_offset is 1, the second-to-last partition ends before the current time,
             and so on.
-        exclusions (Optional[Set[str]]): Specifies a set of partition keys to be excluded from the
-            partition set.
+        exclusions (Optional[Set[Union[str, datetime]]]): Specifies a set of cron strings or
+            datetime objects that should be excluded from the partition set. Every tick of the
+            cron schedule that matches an excluded datetime or matches the tick of an excluded
+            cron string will be excluded from the partition set.
 
     .. code-block:: python
 
@@ -1643,7 +1683,7 @@ class MonthlyPartitionsDefinition(TimeWindowPartitionsDefinition):
         timezone: Optional[str] = None,
         fmt: Optional[str] = None,
         end_offset: int = 0,
-        exclusions: Optional[set[str]] = None,
+        exclusions: Optional[set[Union[str, datetime]]] = None,
         **kwargs,
     ):
         _fmt = fmt or DEFAULT_DATE_FORMAT
@@ -1684,7 +1724,7 @@ def monthly_partitioned_config(
     fmt: Optional[str] = None,
     end_offset: int = 0,
     tags_for_partition_fn: Optional[Callable[[datetime, datetime], Mapping[str, str]]] = None,
-    exclusions: Optional[set[str]] = None,
+    exclusions: Optional[set[Union[str, datetime]]] = None,
 ) -> Callable[
     [Callable[[datetime, datetime], Mapping[str, Any]]],
     PartitionedConfig[MonthlyPartitionsDefinition],
@@ -1722,8 +1762,10 @@ def monthly_partitioned_config(
         tags_for_partition_fn (Optional[Callable[[str], Mapping[str, str]]]): A function that
             accepts a partition time window and returns a dictionary of tags to attach to runs for
             that partition.
-        exclusions (Optional[Set[str]]): Specifies a set of partition keys to be excluded from the
-            partition set.
+        exclusions (Optional[Set[Union[str, datetime]]]): Specifies a set of cron strings or
+            datetime objects that should be excluded from the partition set. Every tick of the
+            cron schedule that matches an excluded datetime or matches the tick of an excluded
+            cron string will be excluded from the partition set.
 
     .. code-block:: python
 
@@ -1790,8 +1832,10 @@ class WeeklyPartitionsDefinition(TimeWindowPartitionsDefinition):
             passed. If end_offset is 0 (the default), the last partition ends before the current
             time. If end_offset is 1, the second-to-last partition ends before the current time,
             and so on.
-        exclusions (Optional[Set[str]]): Specifies a set of partition keys to be excluded from the
-            partition set.
+        exclusions (Optional[Set[Union[str, datetime]]]): Specifies a set of cron strings or
+            datetime objects that should be excluded from the partition set. Every tick of the
+            cron schedule that matches an excluded datetime or matches the tick of an excluded
+            cron string will be excluded from the partition set.
 
     .. code-block:: python
 
@@ -1818,7 +1862,7 @@ class WeeklyPartitionsDefinition(TimeWindowPartitionsDefinition):
         timezone: Optional[str] = None,
         fmt: Optional[str] = None,
         end_offset: int = 0,
-        exclusions: Optional[set[str]] = None,
+        exclusions: Optional[set[Union[str, datetime]]] = None,
         **kwargs,
     ):
         _fmt = fmt or DEFAULT_DATE_FORMAT
@@ -1853,7 +1897,7 @@ def weekly_partitioned_config(
     fmt: Optional[str] = None,
     end_offset: int = 0,
     tags_for_partition_fn: Optional[Callable[[datetime, datetime], Mapping[str, str]]] = None,
-    exclusions: Optional[set[str]] = None,
+    exclusions: Optional[set[Union[str, datetime]]] = None,
 ) -> Callable[
     [Callable[[datetime, datetime], Mapping[str, Any]]],
     PartitionedConfig[WeeklyPartitionsDefinition],
@@ -1892,8 +1936,10 @@ def weekly_partitioned_config(
         tags_for_partition_fn (Optional[Callable[[str], Mapping[str, str]]]): A function that
             accepts a partition time window and returns a dictionary of tags to attach to runs for
             that partition.
-        exclusions (Optional[Set[str]]): Specifies a set of partition keys to be excluded from the
-            partition set.
+        exclusions (Optional[Set[Union[str, datetime]]]): Specifies a set of cron strings or
+            datetime objects that should be excluded from the partition set. Every tick of the
+            cron schedule that matches an excluded datetime or matches the tick of an excluded
+            cron string will be excluded from the partition set.
 
     .. code-block:: python
 

@@ -2093,19 +2093,19 @@ def test_reverse_pagination_negative_end_offset():
 
 
 def test_exclusions():
-    company_holidays = {
-        "2025-01-01",
-        "2025-01-20",
-        "2025-02-17",
-        "2025-05-26",
-        "2025-06-19",
-        "2025-07-04",
-        "2025-09-01",
-        "2025-11-27",
-        "2025-11-28",
-        "2025-12-24",
-        "2025-12-25",
-    }
+    company_holidays = [
+        create_datetime(2025, 1, 1),
+        create_datetime(2025, 1, 20),
+        create_datetime(2025, 2, 17),
+        create_datetime(2025, 5, 26),
+        create_datetime(2025, 6, 19),
+        create_datetime(2025, 7, 4),
+        create_datetime(2025, 9, 1),
+        create_datetime(2025, 11, 27),
+        create_datetime(2025, 11, 28),
+        create_datetime(2025, 12, 24),
+        create_datetime(2025, 12, 25),
+    ]
     daily_calendar = TimeWindowPartitionsDefinition(
         start="2025-01-01",
         end="2026-01-01",
@@ -2116,14 +2116,20 @@ def test_exclusions():
         start="2025-01-01",
         end="2026-01-01",
         fmt="%Y-%m-%d",
-        cron_schedule="0 0 * * 1-5",  # weekdays only
+        cron_schedule="0 0 * * *",
+        exclusions={
+            "0 0 * * 6-7",  # exclude weekends
+        },
     )
     dagsterlabs_calendar = TimeWindowPartitionsDefinition(
         start="2025-01-01",
         end="2026-01-01",
         fmt="%Y-%m-%d",
-        cron_schedule="0 0 * * 1-5",  # weekdays only
-        exclusions=company_holidays,
+        cron_schedule="0 0 * * *",  # weekdays only
+        exclusions={
+            "0 0 * * 6-7",  # exclude weekends
+            *company_holidays,  # exclude company holidays
+        },
     )
 
     assert daily_calendar.get_first_partition_key() == "2025-01-01"
@@ -2143,6 +2149,13 @@ def test_exclusions():
     assert daily_calendar.get_num_partitions(current_time=next_year) == 365
     assert weekday_calendar.get_num_partitions(current_time=next_year) == 261
     assert dagsterlabs_calendar.get_num_partitions(current_time=next_year) == 250
+
+    # get the time window for a Friday
+    monday = datetime.strptime("2025-01-13", "%Y-%m-%d")
+    window = weekday_calendar.get_prev_partition_window(monday)
+    assert window
+    assert window.start == datetime.strptime("2025-01-10", "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    assert window.end == datetime.strptime("2025-01-11", "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
     # get the time window for the day before a holiday
     assert dagsterlabs_calendar.get_next_partition_key("2025-12-23", next_year) == "2025-12-26"
