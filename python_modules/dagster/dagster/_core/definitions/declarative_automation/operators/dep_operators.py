@@ -35,6 +35,10 @@ class EntityMatchesCondition(
     def name(self) -> str:
         return self.key.to_user_string()
 
+    @property
+    def children(self) -> Sequence[AutomationCondition]:
+        return [self.operand]
+
     async def evaluate(  # pyright: ignore[reportIncompatibleMethodOverride]
         self, context: AutomationContext[T_EntityKey]
     ) -> AutomationResult[T_EntityKey]:
@@ -108,6 +112,10 @@ class DepsAutomationCondition(BuiltinAutomationCondition[T_EntityKey]):
         if props:
             name += f"({','.join(props)})"
         return name
+
+    @property
+    def children(self) -> Sequence[AutomationCondition]:
+        return [self.operand]
 
     @property
     def requires_cursor(self) -> bool:
