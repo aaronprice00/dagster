@@ -20,6 +20,10 @@ def hammer_op(context, chase_duration):
     """What better way to do a lot of gnarly work than to pointer chase?"""
     ptr_length = context.op_config["chase_size"]
 
+    for i in range(1000000):
+        print("I AM SLOWING WRITING IN A LOOP\n")
+        time.sleep(5)
+
     data = list(range(0, ptr_length))
     random.shuffle(data)
 
