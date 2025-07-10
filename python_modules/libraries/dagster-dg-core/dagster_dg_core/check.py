@@ -193,6 +193,4 @@ def check_yaml(
             )
         return False
     else:
-        click.echo("All components validated successfully.")
-
         return True

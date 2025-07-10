@@ -55,7 +55,10 @@ def check_yaml_command(
         # defer for import performance
         from dagster_dg_core.check import check_yaml as check_yaml_fn
 
-        return check_yaml_fn(dg_context, resolved_paths, validate_requirements)
+        success = check_yaml_fn(dg_context, resolved_paths, validate_requirements)
+        if success:
+            click.echo("All components validated successfully.")
+        return success
 
     if watch:
         watched_paths = (
